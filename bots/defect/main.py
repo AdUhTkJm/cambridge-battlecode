@@ -1,5 +1,4 @@
 from cambc import Controller, Direction, EntityType, Environment, Position, GameConstants, GameError
-from enum import Enum
 import math
 import heapq
 import sys
@@ -14,10 +13,13 @@ PHASE_BEGIN_CORE_BOTS = 6
 # Diagonal and straight directions.
 DIRECTIONS_DIAG = [(-1, -1), (-1, 1), (1, 1), (1, -1)]
 DIRECTIONS_STR = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+DIRECTIONS = [*DIRECTIONS_DIAG, *DIRECTIONS_STR]
 
-# Bot types.
+# Bot states.
 BOT_UNASSIGNED = 0
 BOT_EXPLORER = 1
+BOT_CONVEYOR_BUILDER = 2
+BOT_WAIT_FOR_HARVEST = 3
 
 def get_id_at(ct: Controller, pos: Position) -> int | None:
   """
@@ -50,10 +52,16 @@ def get_delta_within_range(r) -> list[tuple[int, int]]:
 
   return pairs
 
-def neighbours_of(pos):
+def neighbours_of_8(pos):
   x, y = pos
   return [
     (x + 1, y + 1), (x + 1, y - 1), (x - 1, y - 1), (x - 1, y + 1),
+    (x, y + 1), (x + 1, y), (x, y - 1), (x - 1, y)
+  ]
+
+def neighbours_of_4(pos):
+  x, y = pos
+  return [
     (x, y + 1), (x + 1, y), (x, y - 1), (x - 1, y)
   ]
 
@@ -72,19 +80,24 @@ _DIRECTION_TABLE = {
 def as_direction(dx, dy):
   return _DIRECTION_TABLE[(dx, dy)]
   
-def a_star_heuristic(x, y):
+def l_inf(x, y):
   return max(abs(x[0] - x[1]), abs(y[0] - y[1]))
+
+def l_1(x, y):
+  return abs(x[0] - x[1]) + abs(y[0] - y[1])
 
 def log(msg):
   print(msg, file=sys.stderr)
+
+def sgn(x):
+  return 1 if x > 0 else -1
 
 def would_be_passable(ct: Controller, pos: Position):
   if not (ct.is_tile_empty(pos) or ct.is_tile_passable(pos)):
     return False
   
   id = get_id_at(ct, pos)
-  if id is None or ct.get_entity_type(id) == EntityType.ROAD or ct.get_entity_type(id) == EntityType.CONVEYOR:
-    return True
+  return id is None or ct.get_entity_type(id) == EntityType.ROAD or ct.get_entity_type(id) == EntityType.CONVEYOR
 
 class Player:
   def __init__(self):
@@ -104,7 +117,7 @@ class Player:
     # The position of the core.
     self.core_pos = None
     # The type of this bot.
-    self.bot_type = BOT_UNASSIGNED
+    self.state = BOT_UNASSIGNED
     # The target (destination) of this bot.
     self.tgt: Position = None
     # The map of the battlefield. Only concerns whether a grid is passable.
@@ -113,9 +126,18 @@ class Player:
     self.next: tuple[int, int] = None
     # The number of turns that the bot is wandering.
     self.wandering = 1
-    # Width and height of the map.
-    self.width = 256
-    self.height = 256
+    # Last direction in which the bot is wandering.
+    self.last_dir = None
+    # Whether the bot has been initialized after being put into conveyor state.
+    self.conveyor_init = False
+    # The ore deposite that the conveyor should originate from.
+    self.ore_pos = None
+    # The corner of the kernel where the conveyor is transmitted.
+    self.transmitted_corner = None
+    # The path of the conveyor.
+    self.path = None
+    # Current index of the convery path that we're processing.
+    self.path_i = -1
 
     self.bot_visible = get_delta_within_range(GameConstants.BUILDER_BOT_VISION_RADIUS_SQ)
 
@@ -142,17 +164,22 @@ class Player:
   def run_bot(self, ct: Controller):
     x = time.perf_counter()
     id = ct.get_id()
-    if self.bot_type == BOT_UNASSIGNED:
+    if self.state == BOT_UNASSIGNED:
       self.init_bot(ct)
     
-    if self.bot_type == BOT_EXPLORER:
+    if self.state == BOT_EXPLORER:
       self.explore(ct, id)
+    elif self.state == BOT_CONVEYOR_BUILDER:
+      self.build_conveyor(ct, id)
+    elif self.state == BOT_WAIT_FOR_HARVEST:
+      self.build_harvester(ct, id)
+    
     log(f"bot {id}: runtime {(time.perf_counter() - x) * 1000:.6f} ms")
 
   def init_bot(self, ct: Controller):
     core = find_core(ct)
     self.core_pos = ct.get_position(core)
-    self.bot_type = BOT_EXPLORER
+    self.state = BOT_EXPLORER
     self.scan_map(ct)
 
   def find_target(self, ct: Controller, id: int):
@@ -162,46 +189,67 @@ class Player:
     # Find a target.
     # Focus on getting ores.
     pos = ct.get_position(id)
+    x, y = pos
     self.tgt = self.find_ore(ct)
     if self.tgt is not None:
-      log(f"bot {id}: guided by ore")
       self.wandering = 0
       return
-
+    
     # When we cannot find an ore deposit, we randomly choose a direction to explore.
     # We want it to be consistent (not moving north and then south in consecutive turns),
-    # so we're using `id` here: the direction will be the same for each bot.
-    start = id + (self.wandering >> 3)
+    # so we try last direction first.
     allowed = ct.get_nearby_tiles(2)
-    for w in range(start, start + 4):
+    if self.last_dir is not None:
+      dx, dy = self.last_dir
+      tgt = Position(x + dx, y + dy)
+      if tgt in allowed and would_be_passable(ct, tgt):
+        self.tgt = tgt
+        self.wandering += 1
+        return
+      
+      # When this hits a wall or another obstacle, we try reflecting the way.
+      tgt = Position(x + dx, y - dy)
+      if tgt in allowed and would_be_passable(ct, tgt):
+        self.tgt = tgt
+        self.last_dir = (dx, -dy)
+        self.wandering += 1
+        return
+      tgt = Position(x - dx, y + dy)
+      if tgt in allowed and would_be_passable(ct, tgt):
+        self.tgt = tgt
+        self.last_dir = (-dx, dy)
+        self.wandering += 1
+        return
+
+    # When none of these work, we search all other directions.
+    for w in range(id, id + 4):
       dx, dy = DIRECTIONS_DIAG[w & 3]
-      tgt = Position(pos.x + dx, pos.y + dy)
+      tgt = Position(x + dx, y + dy)
       if tgt not in allowed:
         continue
       if would_be_passable(ct, tgt):
         self.tgt = tgt
-        # self.next = (tgt[0], tgt[1])
+        self.last_dir = (dx, dy)
         self.wandering += 1
         # We prefer empty tiles, so we continue searching when it's not empty.
         if ct.is_tile_empty(tgt):
           break
 
     if self.tgt is None:
-      for w in range(start, start + 4):
+      for w in range(id, id + 4):
         dx, dy = DIRECTIONS_STR[w & 3]
-        tgt = Position(pos.x + dx, pos.y + dy)
+        tgt = Position(x + dx, y + dy)
         if tgt not in allowed:
           continue
         if would_be_passable(ct, tgt):
           self.tgt = tgt
-          # self.next = (tgt[0], tgt[1])
+          self.last_dir = (dx, dy)
           self.wandering += 1
           if ct.is_tile_empty(tgt):
             break
-    pass # if end
+    pass #endif
     
   def scan_map(self, ct: Controller):
-    self.passable_map = {}
     for pos in ct.get_nearby_tiles():
       self.passable_map[(pos[0], pos[1])] = would_be_passable(ct, pos)
 
@@ -221,6 +269,8 @@ class Player:
     closed = set()
 
     heapq.heappush(queue, (0, start))
+    neighbours = neighbours_of_8 if self.state == BOT_EXPLORER else neighbours_of_4
+    heuristic = l_inf if self.state == BOT_EXPLORER else l_1
 
     came_from = {}
     g = { start: 0 }
@@ -241,7 +291,7 @@ class Player:
       
       closed.add(current)
 
-      for neighbour in neighbours_of(current):
+      for neighbour in neighbours(current):
         if not self.passable_map.get(neighbour, False):
           continue
 
@@ -250,10 +300,23 @@ class Player:
         if tentative < g.get(neighbour, float("inf")):
           came_from[neighbour] = current
           g[neighbour] = tentative
-          f_score = tentative + a_star_heuristic(neighbour, goal)
+          f_score = tentative + heuristic(neighbour, goal)
           heapq.heappush(queue, (f_score, neighbour))
 
     return None
+  
+  def switch_to_explorer(self):
+    self.state = BOT_EXPLORER
+    self.tgt = None
+    self.next = None
+    self.wandering = 1
+    self.last_dir = None
+
+  def switch_to_conveyor_builder(self):
+    self.path = None
+    self.path_i = -1
+    self.state = BOT_CONVEYOR_BUILDER
+    self.conveyor_init = False
 
   def explore(self, ct: Controller, id: int):
     log(f"bot {id}: at: {ct.get_position()}")
@@ -282,14 +345,24 @@ class Player:
     nextpos = Position(nx, ny)
     
     # The final step is not needed - we can build a harvester before we step on the tile.
-    for d in Direction:
-      ore = ct.get_position().add(d)
+    for dx, dy in DIRECTIONS:
+      try:
+        ore = Position(nx + dx, ny + dy)
+        env = ct.get_tile_env(ore)
+      except GameError:
+        continue
+
+      if not (env == Environment.ORE_AXIONITE or env == Environment.ORE_TITANIUM) or ct.get_tile_building_id(ore):
+        continue
+
+      self.ore_pos = ore
+      cx, cy = self.core_pos
+      self.transmitted_corner = Position(cx + sgn(x - cx), cy + sgn(y - cy))
+      self.tgt = Position(cx + sgn(x - cx), cy + (sgn(y - cy) << 1))
+      self.state = BOT_WAIT_FOR_HARVEST
+      log(f"bot {id}: waiting to build a harvester")
       if ct.can_build_harvester(ore):
-        log(f"bot {id}: built a harvester")
-        ct.build_harvester(ore)
-        self.tgt = None
-        self.next = None
-        self.scan_map(ct)
+        self.build_harvester(ct, id)
         return
 
     if ct.can_build_road(nextpos):
@@ -297,8 +370,6 @@ class Player:
 
     dir = as_direction(nx - x, ny - y)
     if not ct.can_move(dir):
-      # Maybe something changed that blocked the movement.
-      # Try again.
       return
     
     ct.move(dir)
@@ -309,3 +380,93 @@ class Player:
     if ct.get_position() == self.tgt:
       self.tgt = None
     self.next = None
+
+  def build_harvester(self, ct: Controller, id: int):
+    tileid = ct.get_tile_building_id(self.ore_pos)
+    if tileid is not None:
+      self.switch_to_explorer()
+      return
+
+    if not ct.can_build_harvester(self.ore_pos):
+      return
+    
+    ct.build_harvester(self.ore_pos)
+    log(f"bot {id}: built a harvester")
+    self.scan_map(ct)
+    self.switch_to_conveyor_builder()
+
+  def build_conveyor(self, ct: Controller, id: int):
+    if not self.conveyor_init:
+      # We're now near the deposit (8-direction) but not necessary next to it (4-direction).
+      # First move to one of direct position.
+      pos = ct.get_position()
+      ox, oy = self.ore_pos
+      cx, cy = self.core_pos
+      x, y = pos
+      dx, dy = ox - x, oy - y
+      if dx * dy == 0:
+        self.conveyor_init = True
+      else:
+        mx, my = (dx, 0) if (abs(x - cx) + abs(oy - cy)) < (abs(ox - cx) + abs(y - cy)) else (0, dy)
+        dst = Position(x + mx, y + my)
+        dir = as_direction(mx, my)
+        if ct.can_build_road(dst):
+          ct.build_road(dst)
+        if ct.can_move(dir):
+          ct.move(dir)
+          self.conveyor_init = True
+        return
+    pass #endif
+    
+    log(f"bot {id}: conveyor: {ct.get_position()}")
+    if self.path is None:
+      self.path = self.find_direction(ct)
+      if self.path is None:
+        log(f"warning: bot {id}: cannot find path!")
+        self.scan_map(ct)
+        return
+      
+      self.path.append(self.transmitted_corner)
+      log(f"bot {id}: path is {self.path}")
+    
+    # When there are only two final nodes, the direction of the conveyor
+    # is always pointing to the core tile.
+    
+    next, further = self.path[self.path_i + 1], self.path[self.path_i + 2]
+    log(f"bot {id}: direction: {ct.get_position()} -> {next} -> {further}")
+    nx, ny = next
+    fx, fy = further
+    pos = ct.get_position()
+    x, y = pos
+    nextpos = Position(nx, ny)
+
+    # Destroy the road when there's one, to leave space for the conveyor.
+    tileid = ct.get_tile_building_id(nextpos)
+    ent = ct.get_entity_type(tileid) if tileid else None
+    if ent == EntityType.ROAD and ct.can_destroy(nextpos):
+      ct.destroy(nextpos)
+    has_conveyor = ent == EntityType.CONVEYOR
+
+    move_dir = as_direction(nx - x, ny - y)
+    build_dir = as_direction(fx - nx, fy - ny)
+    if not has_conveyor and ct.can_build_conveyor(nextpos, build_dir):
+      ct.build_conveyor(nextpos, build_dir)
+      has_conveyor = True
+
+    # Special case for the first piece of conveyor.
+    if self.path_i == -1 and has_conveyor:
+      self.path_i = 0
+      return
+
+    # Only move after a conveyor has been built.
+    if not has_conveyor or not ct.can_move(move_dir):
+      return
+    
+    ct.move(move_dir)
+    self.scan_map(ct)
+    self.path_i += 1
+
+    # Become an explorer again.
+    if ct.get_position() == self.tgt:
+      self.switch_to_explorer()
+    
