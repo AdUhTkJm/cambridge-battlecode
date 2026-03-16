@@ -6,3 +6,7 @@ __pycache__
 temp
 build
 *.txt
+
+# Official maps and replays.
+maps/
+*.replay26
