@@ -1,0 +1,8 @@
+# Python virtual environments and caches.
+venv
+__pycache__
+
+# Temporary folders.
+temp
+build
+*.txt
