@@ -261,6 +261,13 @@ class Player:
         return pos
     
     return None
+	
+  def find_conveyor(self, ct: Controller):
+    for entity_id in ct.get_nearby_entities():
+      if (ct.get_entitiy_type(entity_id) == EntityType.CONVEYOR):
+        conveyor_pos = ct.get_position(entity_id);
+        return conveyor_pos
+    return None
   
   def find_direction(self, ct: Controller):
     queue = []
